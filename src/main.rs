@@ -126,10 +126,8 @@ fn pack(p: &Payload) -> Result<Vec<u8>> {
     let h = serde_json::to_vec(&m)?;
     let mut raw = (h.len() as u32).to_be_bytes().to_vec();
     raw.extend(h);
-    for k in &p.chunks {
-        if let Some(v) = p.data.get(k) {
-            raw.extend(v);
-        }
+    for (key, _) in &m.data {
+        raw.extend(&p.data[key]);
     }
     let c = zstd::encode_all(raw.as_slice(), 6)?;
     let mut out = MAGIC.to_vec();
@@ -467,4 +465,78 @@ async fn main() -> Result<()> {
         axum::serve(tokio::net::TcpListener::bind(addr).await?, router).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload() -> Payload {
+        let data: HashMap<String, Vec<u8>> =
+            [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+                .into_iter()
+                .map(|chunk| (digest(&chunk), chunk))
+                .collect();
+        let mut chunks: Vec<String> = data.keys().cloned().collect();
+        chunks.reverse();
+        let body: Vec<u8> = chunks.iter().flat_map(|key| data[key].clone()).collect();
+        Payload {
+            version: 3,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            headers: vec![],
+            chunks,
+            sha256: digest(&body),
+            data,
+        }
+    }
+
+    fn assert_roundtrip(payload: &Payload) {
+        let decoded = unpack(&pack(payload).unwrap()).unwrap();
+        assert_eq!(decoded.data, payload.data);
+        assert_eq!(decoded.chunks, payload.chunks);
+        assert_eq!(decoded.sha256, payload.sha256);
+    }
+
+    #[test]
+    fn pack_writes_chunks_in_metadata_order() {
+        let payload = payload();
+        assert_roundtrip(&payload);
+        let decoded = unpack(&pack(&payload).unwrap()).unwrap();
+        let body: Vec<u8> = decoded
+            .chunks
+            .iter()
+            .flat_map(|key| decoded.data[key].clone())
+            .collect();
+        assert_eq!(digest(&body), payload.sha256);
+    }
+
+    #[test]
+    fn pack_writes_repeated_chunks_only_once() {
+        let mut payload = payload();
+        payload.chunks.push(payload.chunks[0].clone());
+        let body: Vec<u8> = payload
+            .chunks
+            .iter()
+            .flat_map(|key| payload.data[key].clone())
+            .collect();
+        payload.sha256 = digest(&body);
+        assert_roundtrip(&payload);
+        let decoded = unpack(&pack(&payload).unwrap()).unwrap();
+        let body: Vec<u8> = decoded
+            .chunks
+            .iter()
+            .flat_map(|key| decoded.data[key].clone())
+            .collect();
+        assert_eq!(digest(&body), payload.sha256);
+    }
+
+    #[test]
+    fn pack_preserves_partial_and_empty_chunk_updates() {
+        let mut payload = payload();
+        payload.data.remove(&payload.chunks[0]);
+        assert_roundtrip(&payload);
+        payload.data.clear();
+        assert_roundtrip(&payload);
+    }
 }
