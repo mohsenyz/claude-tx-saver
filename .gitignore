@@ -15,3 +15,4 @@ dist/
 token
 relay-url
 previous-base-url.json
+target/

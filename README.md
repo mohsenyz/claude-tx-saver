@@ -28,10 +28,24 @@ curl -fsSL https://github.com/mohsenyz/claude-tx-saver/releases/latest/download/
 install -m 755 claude-tx-saver /usr/local/bin/claude-tx-saver
 install -d -m 700 /etc/claude-proxy
 openssl rand -hex 32 > /etc/claude-proxy/token
-openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
-  -keyout /etc/claude-proxy/relay.key -out /etc/claude-proxy/relay.crt \
-  -subj '/CN=claude-tx-saver' -addext "subjectAltName=IP:YOUR_VPS_IP"
-chmod 600 /etc/claude-proxy/token /etc/claude-proxy/relay.key
+openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+  -keyout /etc/claude-proxy/relay-ca.key -out /etc/claude-proxy/relay-ca.crt \
+  -subj '/CN=claude-tx-saver relay CA' \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+openssl req -new -newkey rsa:3072 -nodes \
+  -keyout /etc/claude-proxy/relay.key -out /tmp/relay.csr \
+  -subj '/CN=claude-tx-saver'
+printf '%s\n' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth' \
+  'subjectAltName=IP:YOUR_VPS_IP' > /tmp/relay.ext
+openssl x509 -req -in /tmp/relay.csr -CA /etc/claude-proxy/relay-ca.crt \
+  -CAkey /etc/claude-proxy/relay-ca.key -CAcreateserial \
+  -out /etc/claude-proxy/relay.crt -days 825 -sha256 -extfile /tmp/relay.ext
+rm -f /tmp/relay.csr /tmp/relay.ext /etc/claude-proxy/relay-ca.crt.srl
+chmod 600 /etc/claude-proxy/token /etc/claude-proxy/relay-ca.key /etc/claude-proxy/relay.key
 claude-tx-saver server --port 8443 --token-file /etc/claude-proxy/token \
   --cert /etc/claude-proxy/relay.crt --key /etc/claude-proxy/relay.key
 ```
@@ -41,12 +55,12 @@ domain or certificate purchase is needed.
 
 **2. On your Mac or Linux machine:**
 
-Copy the VPS token and certificate to the client through a trusted channel, then
+Copy the VPS token and **CA certificate** (`relay-ca.crt`) to the client through a trusted channel, then
 start the local relay:
 
 ```sh
 claude-tx-saver client --relay https://YOUR_VPS_IP:8443/v1/relay \
-  --token-file ./token --relay-ca ./relay.crt --port 8787
+  --token-file ./token --relay-ca ./relay-ca.crt --port 8787
 ```
 
 Configure Claude Code to use `http://127.0.0.1:8787`.
