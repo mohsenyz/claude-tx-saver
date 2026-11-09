@@ -113,7 +113,13 @@ fn chunks(body: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 fn pack(p: &Payload) -> Result<Vec<u8>> {
-    let entries: Vec<_> = p.data.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+    // Metadata lengths must use the same order as the bytes below. Iterating
+    // the HashMap here makes multi-chunk envelopes nondeterministic.
+    let entries: Vec<_> = p
+        .chunks
+        .iter()
+        .filter_map(|k| p.data.get(k).map(|v| (k.clone(), v.len())))
+        .collect();
     let m = WireMeta {
         version: p.version,
         method: p.method.clone(),
@@ -121,15 +127,13 @@ fn pack(p: &Payload) -> Result<Vec<u8>> {
         headers: p.headers.clone(),
         chunks: p.chunks.clone(),
         sha256: p.sha256.clone(),
-        data: entries,
+        data: entries.clone(),
     };
     let h = serde_json::to_vec(&m)?;
     let mut raw = (h.len() as u32).to_be_bytes().to_vec();
     raw.extend(h);
-    for k in &p.chunks {
-        if let Some(v) = p.data.get(k) {
-            raw.extend(v);
-        }
+    for (k, _) in &entries {
+        raw.extend(p.data.get(k).expect("metadata/data mismatch"));
     }
     let c = zstd::encode_all(raw.as_slice(), 6)?;
     let mut out = MAGIC.to_vec();
@@ -234,9 +238,13 @@ async fn relay(State(a): State<App>, req: Request<axum::body::Body>) -> Response
     };
     let mut p = match unpack(&bytes) {
         Ok(x) => x,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid relay request").into_response(),
+        Err(e) => {
+            eprintln!("invalid relay envelope: {e:#}");
+            return (StatusCode::BAD_REQUEST, "Invalid relay request").into_response();
+        }
     };
     if p.version != 3 {
+        eprintln!("unsupported relay version: {}", p.version);
         return (StatusCode::BAD_REQUEST, "Invalid relay request").into_response();
     }
     let mut bodyv = Vec::new();
@@ -258,6 +266,13 @@ async fn relay(State(a): State<App>, req: Request<axum::body::Body>) -> Response
         }
     }
     if digest(&bodyv) != p.sha256 {
+        eprintln!(
+            "relay body digest mismatch: expected={} actual={} chunks={} bytes={}",
+            p.sha256,
+            digest(&bodyv),
+            p.chunks.len(),
+            bodyv.len()
+        );
         return (StatusCode::BAD_REQUEST, "Invalid relay request").into_response();
     }
     for (k, v) in p.data.drain() {
@@ -312,7 +327,6 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
     let ps = chunks(&body);
     let manifest: Vec<String> = ps.iter().map(|x| digest(x)).collect();
     let local: HashMap<_, _> = manifest.iter().cloned().zip(ps).collect();
-    let known = a.known.lock().unwrap().clone();
     let mut p = Payload {
         version: 3,
         method: parts.method.to_string(),
@@ -325,32 +339,44 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
         headers: headers(&parts.headers, true),
         chunks: manifest.clone(),
         sha256: digest(&body),
-        data: local
-            .iter()
-            .filter(|(k, _)| !known.contains(*k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        // Send the complete chunk set. This avoids reconstructing a request
+        // from stale client-side cache knowledge after a relay restart.
+        data: local.clone(),
     };
     for attempt in 0..2 {
         let wire = match pack(&p) {
             Ok(x) => x,
             Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
         };
-        let r = a
-            .client
-            .post(&a.upstream)
-            .header("authorization", format!("Bearer {}", a.token))
-            .body(wire)
-            .send()
-            .await;
+        // Connect-phase failures (reset/EOF during TCP or TLS setup) mean the
+        // relay never saw the request, so retrying cannot duplicate a call.
+        let mut tries = 0;
+        let r = loop {
+            let r = a
+                .client
+                .post(&a.upstream)
+                .header("authorization", format!("Bearer {}", a.token))
+                .body(wire.clone())
+                .send()
+                .await;
+            match r {
+                Err(e) if e.is_connect() && tries < 5 => {
+                    tries += 1;
+                    eprintln!("relay connect failed (retry {tries}/5): {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << tries)).await;
+                }
+                r => break r,
+            }
+        };
         let r = match r {
             Ok(x) => x,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("relay connection failed: {e:?}");
                 return (
                     StatusCode::BAD_GATEWAY,
                     "Relay connection failed; request was not retried",
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         let status = r.status();
@@ -373,6 +399,7 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
             }
         }
         if status != StatusCode::OK {
+            eprintln!("relay transport returned HTTP {status}");
             return (StatusCode::BAD_GATEWAY, "Relay transport failed").into_response();
         }
         let raw = r.bytes().await.unwrap_or_default();
@@ -413,7 +440,9 @@ async fn main() -> Result<()> {
     if token.len() < 32 {
         return Err(anyhow!("token must contain at least 32 characters"));
     }
-    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(false);
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(false)
+        .tcp_keepalive(std::time::Duration::from_secs(30));
     if let Some(ca) = args.relay_ca {
         builder =
             builder.add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(ca)?)?);
