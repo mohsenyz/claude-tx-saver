@@ -12,7 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -181,9 +181,41 @@ struct App {
     token: String,
     client: Client,
     upstream: String,
-    cache: Arc<Mutex<LruCache<String, Vec<u8>>>>,
+    cache: Arc<Mutex<ChunkCache>>,
     max_body: usize,
-    known: Arc<Mutex<HashSet<String>>>,
+    known: Arc<Mutex<LruCache<String, ()>>>,
+}
+
+/// Relay chunk store bounded by total bytes, so chunks orphaned by context
+/// compaction age out instead of growing memory forever.
+struct ChunkCache {
+    lru: LruCache<String, Vec<u8>>,
+    bytes: usize,
+    cap: usize,
+}
+impl ChunkCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            lru: LruCache::unbounded(),
+            bytes: 0,
+            cap,
+        }
+    }
+    fn get(&mut self, k: &str) -> Option<Vec<u8>> {
+        self.lru.get(k).cloned()
+    }
+    fn put(&mut self, k: String, v: Vec<u8>) {
+        self.bytes += v.len();
+        if let Some(old) = self.lru.put(k, v) {
+            self.bytes -= old.len();
+        }
+        while self.bytes > self.cap {
+            match self.lru.pop_lru() {
+                Some((_, old)) => self.bytes -= old.len(),
+                None => break,
+            }
+        }
+    }
 }
 fn headers(req: &HeaderMap, preserve: bool) -> Vec<(String, String)> {
     let hop = [
@@ -253,7 +285,7 @@ async fn relay(State(a): State<App>, req: Request<axum::body::Body>) -> Response
             .data
             .get(k)
             .cloned()
-            .or_else(|| a.cache.lock().unwrap().get(k).cloned());
+            .or_else(|| a.cache.lock().unwrap().get(k));
         match v {
             Some(v) => bodyv.extend(v),
             None => {
@@ -275,8 +307,11 @@ async fn relay(State(a): State<App>, req: Request<axum::body::Body>) -> Response
         );
         return (StatusCode::BAD_REQUEST, "Invalid relay request").into_response();
     }
-    for (k, v) in p.data.drain() {
-        a.cache.lock().unwrap().put(k, v);
+    {
+        let mut c = a.cache.lock().unwrap();
+        for (k, v) in p.data.drain() {
+            c.put(k, v);
+        }
     }
     let method = Method::from_bytes(p.method.as_bytes()).unwrap_or(Method::GET);
     let url = format!("{}{}", a.upstream.trim_end_matches('/'), p.path);
@@ -327,6 +362,14 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
     let ps = chunks(&body);
     let manifest: Vec<String> = ps.iter().map(|x| digest(x)).collect();
     let local: HashMap<_, _> = manifest.iter().cloned().zip(ps).collect();
+    let delta: HashMap<_, _> = {
+        let known = a.known.lock().unwrap();
+        local
+            .iter()
+            .filter(|(k, _)| !known.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
     let mut p = Payload {
         version: 3,
         method: parts.method.to_string(),
@@ -339,9 +382,9 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
         headers: headers(&parts.headers, true),
         chunks: manifest.clone(),
         sha256: digest(&body),
-        // Send the complete chunk set. This avoids reconstructing a request
-        // from stale client-side cache knowledge after a relay restart.
-        data: local.clone(),
+        // Only chunks the relay has not acknowledged. A stale view (relay
+        // restart or eviction) yields 409 and the full set is resent below.
+        data: delta,
     };
     for attempt in 0..2 {
         let wire = match pack(&p) {
@@ -381,22 +424,12 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
         };
         let status = r.status();
         if status == StatusCode::CONFLICT && attempt == 0 {
-            let miss: serde_json::Value =
-                serde_json::from_slice(&r.bytes().await.unwrap_or_default()).unwrap_or_default();
-            if let Some(xs) = miss["missing"].as_array() {
-                p.data = xs
-                    .iter()
-                    .filter_map(|x| x.as_str())
-                    .filter_map(|k| local.get(k).map(|v| (k.to_string(), v.clone())))
-                    .collect();
-                continue;
-            } else {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "Relay cache synchronization failed",
-                )
-                    .into_response();
-            }
+            // The relay reports only the first missing chunk and discards
+            // the partial upload, so resend everything and forget the stale view.
+            eprintln!("relay cache miss; resending full chunk set");
+            a.known.lock().unwrap().clear();
+            p.data = local.clone();
+            continue;
         }
         if status != StatusCode::OK {
             eprintln!("relay transport returned HTTP {status}");
@@ -423,7 +456,12 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
                 out = out.header(n, x);
             }
         }
-        *a.known.lock().unwrap() = manifest.into_iter().collect();
+        {
+            let mut known = a.known.lock().unwrap();
+            for k in manifest {
+                known.put(k, ());
+            }
+        }
         return out.body(raw[4 + n..].to_vec().into()).unwrap();
     }
     StatusCode::BAD_GATEWAY.into_response()
@@ -458,9 +496,11 @@ async fn main() -> Result<()> {
             args.relay
                 .ok_or_else(|| anyhow!("--relay is required in client mode"))?
         },
-        cache: Arc::new(Mutex::new(LruCache::unbounded())),
+        cache: Arc::new(Mutex::new(ChunkCache::new(args.cache_mib * 1024 * 1024))),
         max_body: args.max_body_mib * 1024 * 1024,
-        known: Arc::new(Mutex::new(HashSet::new())),
+        // ponytail: fixed digest count (~ a few hundred MiB of chunks); stale
+        // entries only cost one 409 round trip.
+        known: Arc::new(Mutex::new(LruCache::new(65536.try_into().unwrap()))),
     };
     let router = if server {
         Router::new().route("/v1/relay", any(relay)).with_state(app)
@@ -496,4 +536,59 @@ async fn main() -> Result<()> {
         axum::serve(tokio::net::TcpListener::bind(addr).await?, router).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_evicts_by_bytes() {
+        let mut c = ChunkCache::new(10);
+        c.put("a".into(), vec![0; 4]);
+        c.put("b".into(), vec![0; 4]);
+        c.put("a".into(), vec![0; 4]); // replace, no double count
+        assert_eq!(c.bytes, 8);
+        c.get("a");
+        c.put("c".into(), vec![0; 4]); // evicts LRU "b"
+        assert!(c.get("b").is_none() && c.get("a").is_some() && c.get("c").is_some());
+        assert_eq!(c.bytes, 8);
+    }
+
+    #[test]
+    fn partial_envelope_roundtrip() {
+        let body: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i * 7919).to_le_bytes())
+            .collect();
+        let ps = chunks(&body);
+        assert!(ps.len() > 3);
+        let manifest: Vec<String> = ps.iter().map(|x| digest(x)).collect();
+        // Send only every other chunk, as the delta path does.
+        let data: HashMap<_, _> = manifest
+            .iter()
+            .cloned()
+            .zip(ps.clone())
+            .step_by(2)
+            .collect();
+        let p = Payload {
+            version: 3,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            headers: vec![],
+            chunks: manifest.clone(),
+            sha256: digest(&body),
+            data,
+        };
+        let u = unpack(&pack(&p).unwrap()).unwrap();
+        let mut cache = ChunkCache::new(usize::MAX);
+        for (k, v) in manifest.iter().zip(&ps).skip(1).step_by(2) {
+            cache.put(k.clone(), v.clone());
+        }
+        let rebuilt: Vec<u8> = u
+            .chunks
+            .iter()
+            .flat_map(|k| u.data.get(k).cloned().or_else(|| cache.get(k)).unwrap())
+            .collect();
+        assert_eq!(digest(&rebuilt), u.sha256);
+    }
 }
