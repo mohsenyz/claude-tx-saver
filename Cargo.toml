@@ -1,6 +1,6 @@
 [package]
 name = "claude-tx-saver"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 
 [dependencies]
@@ -19,5 +19,7 @@ tokio = { version = "1", features = ["full"] }
 zstd = "0.13"
 lru = "0.12"
 hex = "0.4"
+futures-util = "0.3"
+bytes = "1"
 url = "2"
 subtle = "2"

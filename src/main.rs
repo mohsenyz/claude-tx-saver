@@ -7,6 +7,7 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, ValueEnum};
+use futures_util::StreamExt;
 use lru::LruCache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -348,9 +349,34 @@ async fn relay(State(a): State<App>, req: Request<axum::body::Body>) -> Response
     .unwrap();
     let mut framed = (meta.len() as u32).to_be_bytes().to_vec();
     framed.extend(meta);
-    framed.extend(r.bytes().await.unwrap_or_default());
-    *out.body_mut() = framed.into();
+    // Stream the upstream body as it arrives. Buffering it left the link
+    // silent for the whole generation, and middleboxes drop TCP flows idle
+    // for ~100s, so long responses (compaction, big outputs) always failed.
+    let head = futures_util::stream::once(async move { Ok(bytes::Bytes::from(framed)) });
+    *out.body_mut() = axum::body::Body::from_stream(head.chain(r.bytes_stream()));
     out
+}
+
+/// Split a streamed relay response into its metadata frame and the rest of
+/// the body stream, without waiting for the body to finish.
+async fn read_frame<S>(mut s: S) -> Option<(ResponseMeta, bytes::Bytes, S)>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    let mut buf = Vec::new();
+    loop {
+        if buf.len() >= 4 {
+            let n = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+            if n > MAX_METADATA {
+                return None;
+            }
+            if buf.len() >= 4 + n {
+                let m = serde_json::from_slice(&buf[4..4 + n]).ok()?;
+                return Some((m, bytes::Bytes::copy_from_slice(&buf[4 + n..]), s));
+            }
+        }
+        buf.extend(s.next().await?.ok()?);
+    }
 }
 
 async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) -> Response {
@@ -435,17 +461,12 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
             eprintln!("relay transport returned HTTP {status}");
             return (StatusCode::BAD_GATEWAY, "Relay transport failed").into_response();
         }
-        let raw = r.bytes().await.unwrap_or_default();
-        if raw.len() < 4 {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        let n = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
-        if 4 + n > raw.len() {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        let m: ResponseMeta = match serde_json::from_slice(&raw[4..4 + n]) {
-            Ok(x) => x,
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        let (m, first, rest) = match read_frame(r.bytes_stream()).await {
+            Some(x) => x,
+            None => {
+                eprintln!("relay response framing failed");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
         };
         let mut out = Response::builder().status(m.status);
         for (k, v) in m.headers {
@@ -462,7 +483,8 @@ async fn client_forward(State(a): State<App>, req: Request<axum::body::Body>) ->
                 known.put(k, ());
             }
         }
-        return out.body(raw[4 + n..].to_vec().into()).unwrap();
+        let body = futures_util::stream::once(async move { Ok(first) }).chain(rest);
+        return out.body(axum::body::Body::from_stream(body)).unwrap();
     }
     StatusCode::BAD_GATEWAY.into_response()
 }
@@ -480,7 +502,10 @@ async fn main() -> Result<()> {
     }
     let mut builder = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
-        .tcp_keepalive(std::time::Duration::from_secs(30));
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        // Middleboxes on the client path kill flows idle for ~100s; reqwest's
+        // 90s default reuses connections that are already dead.
+        .pool_idle_timeout(std::time::Duration::from_secs(30));
     if let Some(ca) = args.relay_ca {
         builder =
             builder.add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(ca)?)?);
